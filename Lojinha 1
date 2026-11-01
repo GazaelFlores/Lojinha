@@ -1,0 +1,199 @@
+# 1. IMPORTAÇÃO DE DEPENDÊNCIAS E CONFIGURAÇÕES INICIAIS
+require('dotenv').config();
+const express = require('express');
+const validator = require('express-openapi-validator');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const db = require('pg');
+const yaml = require('js-yaml');
+
+# 2. CONTRATO OPENAPI (Embutido para rodar em um único arquivo)
+const apiSpec = `
+openapi: 3.0.2
+info:
+    title: API Lojinha Medved
+    version: 1.0.0
+paths:
+    /cadastro:
+        post:
+            requestBody:
+                content: { application/json: { schema: { $ref: '#/components/schemas/auth' } } }
+                required: true
+            responses: { '200': { description: Ok } }
+    /login:
+        post:
+            requestBody:
+                content: { application/json: { schema: { $ref: '#/components/schemas/auth' } } }
+                required: true
+            responses:
+                '200':
+                    content: { application/json: { schema: { $ref: '#/components/schemas/token' } } }
+                    description: Ok
+    /produtos:
+        get:
+            responses:
+                '200':
+                    content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/produto' } } } }
+                    description: Ok
+        post:
+            security: [ { bearer: [] } ]
+            requestBody:
+                content: { application/json: { schema: { $ref: '#/components/schemas/produtoInput' } } }
+                required: true
+            responses: { '201': { description: Created } }
+    '/produtos/{codigo}/vender':
+        put:
+            security: [ { bearer: [] } ]
+            parameters:
+                - { name: codigo, schema: { type: integer }, in: path, required: true }
+                - { name: quantidade, schema: { type: integer }, in: query, required: true }
+            responses:
+                '200': { description: Ok }
+                '409': { description: Sem estoque }
+    /cep/{cep}:
+        get:
+            parameters:
+                - { name: cep, schema: { type: string }, in: path, required: true }
+            responses: { '200': { description: Ok } }
+components:
+    securitySchemes:
+        bearer: { scheme: bearer, bearerFormat: JWT, type: http }
+    schemas:
+        auth:
+            required: [usuario, senha]
+            type: object
+            properties: { usuario: { type: string }, senha: { type: string } }
+        token:
+            type: object
+            properties: { token: { type: string } }
+        produto:
+            type: object
+            properties: { codigo: { type: integer }, nome: { type: string }, estoque: { type: integer } }
+        produtoInput:
+            required: [nome, estoque]
+            type: object
+            properties: { nome: { type: string }, estoque: { type: integer } }
+`;
+
+# 3. CONFIGURAÇÃO DO SERVIDOR E BANCO DE DADOS (PostgreSQL)
+const server = express();
+const port = process.env.EXPRESS_PORT || 8080;
+const pool = new db.Pool({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    database: process.env.DB_DATABASE,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD
+});
+
+server.use(express.json());
+
+# 4. MIDDLEWARE DE VALIDAÇÃO (OpenAPI + Segurança JWT)
+server.use(
+    validator.middleware({
+        apiSpec: yaml.load(apiSpec), # Converte a string YAML para objeto JSON
+        validateRequests: true,
+        validateResponses: false,
+        validateSecurity: {
+            handlers: {
+                bearer: (request, scopes, schema) => {
+                    # Intercepta o token do Header, remove o 'Bearer ' e valida
+                    const token = request.headers.authorization?.replace('Bearer ', '');
+                    request.jwtpayload = jwt.verify(token, process.env.JWT_SECRET);
+                    return true;
+                }
+            }
+        }
+    })
+);
+
+# 5. MIDDLEWARE DE AUTORIZAÇÃO (Roles)
+const rolesMiddleware = (roles) => (request, response, next) => {
+    # Verifica se a role do token está nas roles permitidas para a rota
+    if (!roles.includes(request.jwtpayload.role)) {
+        return response.status(403).json('Acesso negado');
+    }
+    next();
+};
+
+# 6. ROTAS DE AUTENTICAÇÃO (Bcrypt + JWT)
+server.post('/cadastro', async (request, response) => {
+    const hash = bcrypt.hashSync(request.body.senha, 10);
+    await pool.query('INSERT INTO usuario (usuario, senha, role) VALUES ($1, $2, $3)', [request.body.usuario, hash, 1]);
+    response.status(200).json('Usuário criado com sucesso');
+});
+
+server.post('/login', async (request, response) => {
+    const result = await pool.query('SELECT * FROM usuario WHERE usuario = $1', [request.body.usuario]);
+    if (result.rows.length === 0 || !bcrypt.compareSync(request.body.senha, result.rows[0].senha)) {
+        return response.status(401).json('Credenciais inválidas');
+    }
+    const token = jwt.sign(
+        { sub: result.rows[0].usuario, role: result.rows[0].role }, 
+        process.env.JWT_SECRET, 
+        { expiresIn: '1h' }
+    );
+    response.status(200).json({ token });
+});
+
+# 7. ROTAS DA LOJINHA
+server.get('/produtos', async (request, response) => {
+    const result = await pool.query('SELECT * FROM produto');
+    response.status(200).json(result.rows);
+});
+
+server.post('/produtos', rolesMiddleware([2]), async (request, response) => {
+    const result = await pool.query('INSERT INTO produto (nome, estoque) VALUES ($1, $2) RETURNING *', [request.body.nome, request.body.estoque]);
+    response.status(201).json(result.rows[0]);
+});
+
+# 8. TRANSAÇÃO DE VENDA (Controle de Estoque)
+server.put('/produtos/:codigo/vender', rolesMiddleware([1, 2]), async (request, response) => {
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+        
+        # Trava a linha (FOR UPDATE) para evitar condições de corrida
+        const result = await client.query('SELECT * FROM produto WHERE codigo = $1 FOR UPDATE', [request.params.codigo]);
+        
+        if (result.rows.length === 0) {
+            const error = new Error('Produto não encontrado'); error.status = 404; throw error;
+        }
+        if (result.rows[0].estoque < request.query.quantidade) {
+            const error = new Error('Estoque insuficiente'); error.status = 409; throw error;
+        }
+        
+        await client.query('UPDATE produto SET estoque = estoque - $1 WHERE codigo = $2', [request.query.quantidade, request.params.codigo]);
+        await client.query('COMMIT');
+        
+        response.status(200).json('Venda realizada com sucesso');
+    } catch (error) {
+        if (client) await client.query('ROLLBACK'); # Cancela tudo se der erro
+        response.status(error.status || 500).json(error.message);
+    } finally {
+        if (client) client.release(); # Devolve a conexão pro pool
+    }
+});
+
+# 9. CONSUMO DE API EXTERNA (Fetch)
+server.get('/cep/:cep', async (request, response) => {
+    try {
+        const fetch_response = await fetch(`https://viacep.com.br/ws/${request.params.cep}/json/`);
+        if (!fetch_response.ok) throw new Error('Erro na API externa');
+        const data = await fetch_response.json();
+        response.status(200).json(data);
+    } catch (error) {
+        response.status(500).json('Erro ao buscar CEP');
+    }
+});
+
+# 10. MIDDLEWARE GLOBAL DE ERRO
+server.use((error, request, response, next) => {
+    console.log(error.stack);
+    response.status(error.status || 500).json(error.message);
+});
+
+server.listen(port, () => {
+    console.log(`Lojinha Medved rodando em http://localhost:${port}`);
+});
