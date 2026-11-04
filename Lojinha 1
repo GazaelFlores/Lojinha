@@ -1,199 +1,334 @@
-# 1. IMPORTAÇÃO DE DEPENDÊNCIAS E CONFIGURAÇÕES INICIAIS
-require('dotenv').config();
-const express = require('express');
-const validator = require('express-openapi-validator');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcrypt');
-const db = require('pg');
-const yaml = require('js-yaml');
+import express from "express";
+import cors from "cors";
+import pino from "pino";
+import pg from "pg";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import { Router } from "express";
+import * as OpenApiValidator from "express-openapi-validator";
+import yaml from "yaml";
 
-# 2. CONTRATO OPENAPI (Embutido para rodar em um único arquivo)
-const apiSpec = `
+// ==========================================
+// CONTRATO OPENAPI EMBUTIDO
+// ==========================================
+const apiSpecString = `
 openapi: 3.0.2
 info:
-    title: API Lojinha Medved
-    version: 1.0.0
+  title: Lojinha API
+  version: 1.0.0
 paths:
-    /cadastro:
-        post:
-            requestBody:
-                content: { application/json: { schema: { $ref: '#/components/schemas/auth' } } }
-                required: true
-            responses: { '200': { description: Ok } }
-    /login:
-        post:
-            requestBody:
-                content: { application/json: { schema: { $ref: '#/components/schemas/auth' } } }
-                required: true
-            responses:
-                '200':
-                    content: { application/json: { schema: { $ref: '#/components/schemas/token' } } }
-                    description: Ok
-    /produtos:
-        get:
-            responses:
-                '200':
-                    content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/produto' } } } }
-                    description: Ok
-        post:
-            security: [ { bearer: [] } ]
-            requestBody:
-                content: { application/json: { schema: { $ref: '#/components/schemas/produtoInput' } } }
-                required: true
-            responses: { '201': { description: Created } }
-    '/produtos/{codigo}/vender':
-        put:
-            security: [ { bearer: [] } ]
-            parameters:
-                - { name: codigo, schema: { type: integer }, in: path, required: true }
-                - { name: quantidade, schema: { type: integer }, in: query, required: true }
-            responses:
-                '200': { description: Ok }
-                '409': { description: Sem estoque }
-    /cep/{cep}:
-        get:
-            parameters:
-                - { name: cep, schema: { type: string }, in: path, required: true }
-            responses: { '200': { description: Ok } }
+  /api/healthz:
+    get:
+      responses:
+        '200': { description: Ok }
+  /api/cadastro:
+    post:
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/auth' } } }
+        required: true
+      responses:
+        '201': { description: Created }
+        '400': { description: Bad Request }
+        '409': { description: Conflict }
+  /api/login:
+    post:
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/auth' } } }
+        required: true
+      responses:
+        '200':
+          content: { application/json: { schema: { type: object, properties: { token: { type: string } } } } }
+          description: Ok
+  /api/produtos:
+    get:
+      responses:
+        '200':
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/produto' } } } }
+          description: Ok
+    post:
+      security: [ { bearer: [] } ]
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/produtoInput' } } }
+        required: true
+      responses:
+        '201': { description: Created }
+  /api/produtos/{codigo}/vender:
+    put:
+      security: [ { bearer: [] } ]
+      parameters:
+        - { name: codigo, schema: { type: integer }, in: path, required: true }
+        - { name: quantidade, schema: { type: integer }, in: query, required: true }
+      responses:
+        '200': { description: Ok }
+        '409': { description: Conflict }
+  /api/cep/{cep}:
+    get:
+      parameters:
+        - { name: cep, schema: { type: string }, in: path, required: true }
+      responses:
+        '200': { description: Ok }
 components:
-    securitySchemes:
-        bearer: { scheme: bearer, bearerFormat: JWT, type: http }
-    schemas:
-        auth:
-            required: [usuario, senha]
-            type: object
-            properties: { usuario: { type: string }, senha: { type: string } }
-        token:
-            type: object
-            properties: { token: { type: string } }
-        produto:
-            type: object
-            properties: { codigo: { type: integer }, nome: { type: string }, estoque: { type: integer } }
-        produtoInput:
-            required: [nome, estoque]
-            type: object
-            properties: { nome: { type: string }, estoque: { type: integer } }
+  securitySchemes:
+    bearer: { scheme: bearer, bearerFormat: JWT, type: http }
+  schemas:
+    auth:
+      required: [usuario, senha]
+      type: object
+      properties: { usuario: { type: string }, senha: { type: string } }
+      example: { usuario: "admin", senha: "123" }
+    produto:
+      type: object
+      properties: { codigo: { type: integer }, nome: { type: string }, estoque: { type: integer } }
+    produtoInput:
+      required: [nome, estoque]
+      type: object
+      properties: { nome: { type: string }, estoque: { type: integer } }
+      example: { nome: "Teclado", estoque: 10 }
+`;
+const apiSpec = yaml.parse(apiSpecString);
+
+// ==========================================
+// CONFIGURAÇÃO DO BANCO DE DADOS
+// ==========================================
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL precisa estar configurado.");
+}
+const { Pool } = pg;
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+// ==========================================
+// FUNÇÕES DE MANUTENÇÃO
+// ==========================================
+const schemaSQL = `
+CREATE TABLE IF NOT EXISTS usuario (
+  usuario VARCHAR(100) PRIMARY KEY,
+  senha TEXT NOT NULL,
+  role INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS produto (
+  codigo SERIAL PRIMARY KEY,
+  nome VARCHAR(255) NOT NULL,
+  estoque INTEGER NOT NULL DEFAULT 0,
+  CONSTRAINT produto_estoque_nonnegative CHECK (estoque >= 0)
+);
 `;
 
-# 3. CONFIGURAÇÃO DO SERVIDOR E BANCO DE DADOS (PostgreSQL)
-const server = express();
-const port = process.env.EXPRESS_PORT || 8080;
-const pool = new db.Pool({
-    host: process.env.DB_HOST,
-    port: process.env.DB_PORT,
-    database: process.env.DB_DATABASE,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD
-});
+async function initDatabase() {
+  try {
+    await pool.query(schemaSQL);
+    logger.info("Tabelas criadas/verificadas com sucesso.");
+  } catch (error) {
+    logger.error({ err: error }, "Falha ao inicializar banco.");
+  } finally {
+    await pool.end();
+  }
+}
 
-server.use(express.json());
-
-# 4. MIDDLEWARE DE VALIDAÇÃO (OpenAPI + Segurança JWT)
-server.use(
-    validator.middleware({
-        apiSpec: yaml.load(apiSpec), # Converte a string YAML para objeto JSON
-        validateRequests: true,
-        validateResponses: false,
-        validateSecurity: {
-            handlers: {
-                bearer: (request, scopes, schema) => {
-                    # Intercepta o token do Header, remove o 'Bearer ' e valida
-                    const token = request.headers.authorization?.replace('Bearer ', '');
-                    request.jwtpayload = jwt.verify(token, process.env.JWT_SECRET);
-                    return true;
-                }
-            }
-        }
-    })
-);
-
-# 5. MIDDLEWARE DE AUTORIZAÇÃO (Roles)
-const rolesMiddleware = (roles) => (request, response, next) => {
-    # Verifica se a role do token está nas roles permitidas para a rota
-    if (!roles.includes(request.jwtpayload.role)) {
-        return response.status(403).json('Acesso negado');
-    }
-    next();
-};
-
-# 6. ROTAS DE AUTENTICAÇÃO (Bcrypt + JWT)
-server.post('/cadastro', async (request, response) => {
-    const hash = bcrypt.hashSync(request.body.senha, 10);
-    await pool.query('INSERT INTO usuario (usuario, senha, role) VALUES ($1, $2, $3)', [request.body.usuario, hash, 1]);
-    response.status(200).json('Usuário criado com sucesso');
-});
-
-server.post('/login', async (request, response) => {
-    const result = await pool.query('SELECT * FROM usuario WHERE usuario = $1', [request.body.usuario]);
-    if (result.rows.length === 0 || !bcrypt.compareSync(request.body.senha, result.rows[0].senha)) {
-        return response.status(401).json('Credenciais inválidas');
-    }
-    const token = jwt.sign(
-        { sub: result.rows[0].usuario, role: result.rows[0].role }, 
-        process.env.JWT_SECRET, 
-        { expiresIn: '1h' }
+async function createAdmin(username, password) {
+  if (!username || !password) {
+    logger.error("Uso: node server.js --create-admin <usuario> <senha>");
+    await pool.end();
+    return;
+  }
+  try {
+    const senhaHash = await bcrypt.hash(password, 12);
+    await pool.query(
+      "INSERT INTO usuario (usuario, senha, role) VALUES ($1, $2, 2) ON CONFLICT (usuario) DO UPDATE SET senha = $2, role = 2",
+      [username, senhaHash]
     );
-    response.status(200).json({ token });
-});
+    logger.info(`Admin '${username}' criado com sucesso.`);
+  } catch (error) {
+    logger.error({ err: error }, "Falha ao criar admin.");
+  } finally {
+    await pool.end();
+  }
+}
 
-# 7. ROTAS DA LOJINHA
-server.get('/produtos', async (request, response) => {
-    const result = await pool.query('SELECT * FROM produto');
-    response.status(200).json(result.rows);
-});
+// ==========================================
+// VERIFICAÇÃO DE ARGUMENTOS
+// ==========================================
+const args = process.argv.slice(2);
+if (args.includes("--init-db")) {
+  initDatabase();
+} else if (args.includes("--create-admin")) {
+  const userIndex = args.indexOf("--create-admin") + 1;
+  createAdmin(args[userIndex], args[userIndex + 1]);
+} else {
+  startServer();
+}
 
-server.post('/produtos', rolesMiddleware([2]), async (request, response) => {
-    const result = await pool.query('INSERT INTO produto (nome, estoque) VALUES ($1, $2) RETURNING *', [request.body.nome, request.body.estoque]);
-    response.status(201).json(result.rows[0]);
-});
+function startServer() {
+  const app = express();
+  const rawPort = process.env.PORT || "8080";
+  const port = Number(rawPort);
 
-# 8. TRANSAÇÃO DE VENDA (Controle de Estoque)
-server.put('/produtos/:codigo/vender', rolesMiddleware([1, 2]), async (request, response) => {
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`Porta inválida: ${rawPort}`);
+  }
+
+  app.use(cors());
+  app.use(express.json({ limit: "100kb" }));
+
+  // Middleware de Validação OpenAPI e Segurança JWT
+  app.use(
+    OpenApiValidator.middleware({
+      apiSpec,
+      validateRequests: true,
+      validateResponses: false,
+      validateSecurity: {
+        handlers: {
+          bearer: (req, scopes, schema) => {
+            const authHeader = req.headers.authorization;
+            if (!authHeader?.startsWith("Bearer ")) throw new Error("Token ausente");
+            const token = authHeader.replace("Bearer ", "");
+            try {
+              req.jwtpayload = jwt.verify(token, process.env.JWT_SECRET?.trim());
+              return true;
+            } catch {
+              throw new Error("Token inválido ou expirado");
+            }
+          },
+        },
+      },
+    })
+  );
+
+  const router = Router();
+  const jwtSecret = process.env.JWT_SECRET?.trim();
+  if (!jwtSecret) throw new Error("Configure JWT_SECRET.");
+
+  class HttpError extends Error {
+    constructor(message, status) {
+      super(message);
+      this.status = status;
+    }
+  }
+
+  function sendError(res, status, message) {
+    return res.status(status).json({ error: message });
+  }
+
+  function requireRole(roles) {
+    return (req, res, next) => {
+      // req.jwtpayload foi injetado pelo OpenApiValidator
+      if (!req.jwtpayload || !roles.includes(req.jwtpayload.role)) {
+        return sendError(res, 403, "Acesso negado");
+      }
+      return next();
+    };
+  }
+
+  // --- ROTAS ---
+  
+  router.get("/healthz", (_req, res) => res.status(200).json({ status: "ok" }));
+
+  router.post("/cadastro", async (req, res) => {
+    try {
+      const senhaHash = await bcrypt.hash(req.body.senha, 12);
+      await pool.query("INSERT INTO usuario (usuario, senha) VALUES ($1, $2)", [req.body.usuario.trim(), senhaHash]);
+      return res.status(201).json({ message: "Usuário criado" });
+    } catch (error) {
+      if (error?.code === "23505") return sendError(res, 409, "Usuário já cadastrado");
+      logger.error({ err: error });
+      return sendError(res, 500, "Erro ao cadastrar");
+    }
+  });
+
+  router.post("/login", async (req, res) => {
+    try {
+      const result = await pool.query("SELECT usuario, senha, role FROM usuario WHERE usuario = $1 LIMIT 1", [req.body.usuario.trim()]);
+      const usuario = result.rows[0];
+      if (!usuario || !(await bcrypt.compare(req.body.senha, usuario.senha))) {
+        return sendError(res, 401, "Credenciais inválidas");
+      }
+      const token = jwt.sign({ sub: usuario.usuario, role: usuario.role }, jwtSecret, { expiresIn: "1h" });
+      return res.status(200).json({ token });
+    } catch (error) {
+      logger.error({ err: error });
+      return sendError(res, 500, "Erro no login");
+    }
+  });
+
+  router.get("/produtos", async (_req, res) => {
+    try {
+      const result = await pool.query("SELECT codigo, nome, estoque FROM produto ORDER BY codigo");
+      return res.status(200).json(result.rows);
+    } catch (error) {
+      return sendError(res, 500, "Erro ao listar produtos");
+    }
+  });
+
+  // ROTA DO VENDEDOR (Admin)
+  router.post("/produtos", requireRole([2]), async (req, res) => {
+    try {
+      const result = await pool.query(
+        `INSERT INTO produto (nome, estoque) VALUES ($1, $2) RETURNING codigo, nome, estoque`,
+        [req.body.nome.trim(), req.body.estoque]
+      );
+      return res.status(201).json(result.rows[0]);
+    } catch (error) {
+      return sendError(res, 500, "Erro ao cadastrar produto");
+    }
+  });
+
+  router.put("/produtos/:codigo/vender", requireRole([1, 2]), async (req, res) => {
+    const codigo = Number(req.params.codigo);
+    const quantidade = Number(req.query.quantidade);
     let client;
     try {
-        client = await pool.connect();
-        await client.query('BEGIN');
-        
-        # Trava a linha (FOR UPDATE) para evitar condições de corrida
-        const result = await client.query('SELECT * FROM produto WHERE codigo = $1 FOR UPDATE', [request.params.codigo]);
-        
-        if (result.rows.length === 0) {
-            const error = new Error('Produto não encontrado'); error.status = 404; throw error;
-        }
-        if (result.rows[0].estoque < request.query.quantidade) {
-            const error = new Error('Estoque insuficiente'); error.status = 409; throw error;
-        }
-        
-        await client.query('UPDATE produto SET estoque = estoque - $1 WHERE codigo = $2', [request.query.quantidade, request.params.codigo]);
-        await client.query('COMMIT');
-        
-        response.status(200).json('Venda realizada com sucesso');
+      client = await pool.connect();
+      await client.query("BEGIN");
+      const result = await client.query("SELECT estoque FROM produto WHERE codigo = $1 FOR UPDATE", [codigo]);
+      const produto = result.rows[0];
+      
+      if (!produto) throw new HttpError("Produto não encontrado", 404);
+      if (produto.estoque < quantidade) throw new HttpError("Estoque insuficiente", 409);
+      
+      await client.query("UPDATE produto SET estoque = estoque - $1 WHERE codigo = $2", [quantidade, codigo]);
+      await client.query("COMMIT");
+      return res.status(200).json({ message: "Venda realizada" });
     } catch (error) {
-        if (client) await client.query('ROLLBACK'); # Cancela tudo se der erro
-        response.status(error.status || 500).json(error.message);
+      if (client) await client.query("ROLLBACK").catch(() => {});
+      if (error instanceof HttpError) return sendError(res, error.status, error.message);
+      return sendError(res, 500, "Erro na venda");
     } finally {
-        if (client) client.release(); # Devolve a conexão pro pool
+      client?.release();
     }
-});
+  });
 
-# 9. CONSUMO DE API EXTERNA (Fetch)
-server.get('/cep/:cep', async (request, response) => {
+  router.get("/cep/:cep", async (req, res) => {
     try {
-        const fetch_response = await fetch(`https://viacep.com.br/ws/${request.params.cep}/json/`);
-        if (!fetch_response.ok) throw new Error('Erro na API externa');
-        const data = await fetch_response.json();
-        response.status(200).json(data);
+      const response = await fetch(`https://viacep.com.br/ws/${req.params.cep}/json/`, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return sendError(res, 502, "Serviço indisponível");
+      const data = await response.json();
+      if (data.erro) return sendError(res, 404, "CEP não encontrado");
+      return res.status(200).json(data);
     } catch (error) {
-        response.status(500).json('Erro ao buscar CEP');
+      return sendError(res, 502, "Erro ao consultar CEP");
     }
-});
+  });
 
-# 10. MIDDLEWARE GLOBAL DE ERRO
-server.use((error, request, response, next) => {
-    console.log(error.stack);
-    response.status(error.status || 500).json(error.message);
-});
+  app.use("/api", router);
 
-server.listen(port, () => {
-    console.log(`Lojinha Medved rodando em http://localhost:${port}`);
-});
+  // Middleware Global de Erros (Inclusive erros de validação do OpenAPI)
+  app.use((err, req, res, next) => {
+    logger.error({ err: err.message, status: err.status }, "Erro capturado");
+    res.status(err.status || 500).json({
+      message: err.message || "Erro interno do servidor",
+      errors: err.errors || undefined,
+    });
+  });
+
+  const server = app.listen(port, () => logger.info({ port }, "Lojinha API rodando com validação OpenAPI"));
+
+  const shutdown = async (signal) => {
+    logger.info(`Recebido ${signal}. Desligando...`);
+    server.close(async () => {
+      await pool.end();
+      process.exit(0);
+    });
+  };
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+}
